@@ -83,7 +83,7 @@ impl TokenGuard {
             masked_blob.push(raw_token[i] ^ random_mask[i]);
         }
 
-        // 🛡️ Physical Memory Purge
+        // ️ Zeroize memory
         raw_token.zeroize();
 
         Self {
@@ -433,7 +433,7 @@ impl Engine {
             LogLevel::Info,
             LogCategory::Session,
             None,
-            "Standardized Listener Active on: {}",
+            "Listener active on: {}",
             addr
         );
 
@@ -443,9 +443,10 @@ impl Engine {
             let mut buf = [0u8; 2048];
             while let Ok((len, peer_addr)) = socket.recv_from(&mut buf).await {
                 if let Ok(Some(event)) = engine.process_packet(&socket, peer_addr, &buf, len).await
-                    && tx.send(event).await.is_err() {
-                        break; // Receiver dropped — dev no longer listening
-                    }
+                    && tx.send(event).await.is_err()
+                {
+                    break; // Receiver dropped — dev no longer listening
+                }
             }
         });
 
@@ -479,7 +480,7 @@ impl Engine {
             });
         }
 
-        // 🛡️ Initiate Handshake (Flag 01)
+        // ️ Initiate handshake
         let my_secret = EphemeralSecret::random_from_rng(OsRng);
         let my_public = PublicKey::from(&my_secret);
         // Client handshake seq: all zeros, bit 63 = 0
@@ -495,31 +496,34 @@ impl Engine {
         let mut stage1_success = false;
         let mut server_pub_bytes = [0u8; 32];
 
-        // 🚀 Stage 1: Send 01, Wait 02 (with Adaptive RTO Retries)
+        // Stage 1: Send INIT, wait for INIT_RESP
         for _ in 0..3 {
             let try_start = Instant::now();
             socket.send_to(&packet, target_addr).await?;
             if let Ok(Ok((len, peer_addr))) =
                 tokio::time::timeout(dyn_rto, socket.recv_from(&mut buf)).await
-                && peer_addr == target_addr && len >= 41 && buf[0] == SUDP_RESP {
-                    let recv_seq = u64::from_be_bytes(buf[1..9].try_into().unwrap_or([0u8; 8]));
-                    if recv_seq == SUDP_DIR_BIT {
-                        // Server response: all zeros, bit 63 = 1
-                        server_pub_bytes.copy_from_slice(&buf[9..41]);
-                        stage1_success = true;
+                && peer_addr == target_addr
+                && len >= 41
+                && buf[0] == SUDP_RESP
+            {
+                let recv_seq = u64::from_be_bytes(buf[1..9].try_into().unwrap_or([0u8; 8]));
+                if recv_seq == SUDP_DIR_BIT {
+                    // Server response: all zeros, bit 63 = 1
+                    server_pub_bytes.copy_from_slice(&buf[9..41]);
+                    stage1_success = true;
 
-                        // 📈 RTO CALIBRATION (Stage 1 ping)
-                        let sample = try_start.elapsed();
-                        srtt = Some(sample);
-                        rttvar = sample / 2;
-                        dyn_rto = srtt.unwrap() + (rttvar * 4);
-                        dyn_rto = dyn_rto.clamp(
-                            Duration::from_millis(SUDP_RTO_MIN),
-                            Duration::from_millis(SUDP_RTO_MAX),
-                        );
-                        break;
-                    }
+                    // Update RTT estimation (Stage 1)
+                    let sample = try_start.elapsed();
+                    srtt = Some(sample);
+                    rttvar = sample / 2;
+                    dyn_rto = srtt.unwrap() + (rttvar * 4);
+                    dyn_rto = dyn_rto.clamp(
+                        Duration::from_millis(SUDP_RTO_MIN),
+                        Duration::from_millis(SUDP_RTO_MAX),
+                    );
+                    break;
                 }
+            }
         }
 
         if !stage1_success {
@@ -532,7 +536,7 @@ impl Engine {
         let shared_key = *shared.as_bytes();
         let key = self.derive_cipher_key(&shared_key);
 
-        // Stage 2: Send 03, Wait 04
+        // Handshake step 2
         let mut token_clear = peer_token.into_bytes();
         let plaintext = token_clear.clone();
         token_clear.zeroize();
@@ -549,61 +553,64 @@ impl Engine {
         let mut stage2_success = false;
         let mut auth_ok = false;
 
-        // 🚀 Stage 2: Send 03, Wait 04 (with Adaptive RTO Retries)
+        // Stage 2: Send AUTH_REQ, wait for AUTH_RESP
         for _ in 0..3 {
             let try_start = Instant::now();
             socket.send_to(&resp_03, target_addr).await?;
             if let Ok(Ok((len, peer_addr))) =
                 tokio::time::timeout(dyn_rto, socket.recv_from(&mut buf)).await
-                && peer_addr == target_addr && len >= 9 && buf[0] == SUDP_AUTH_RESP {
-                    let recv_seq = u64::from_be_bytes(buf[1..9].try_into().unwrap_or([0u8; 8]));
-                    if recv_seq == SUDP_DIR_BIT {
-                        // Server response: all zeros, bit 63 = 1
-                        if let Some(decrypted) =
-                            self.decrypt_payload(&key, SUDP_DIR_BIT, &buf[0..9], &buf[9..len])
-                        {
-                            // Nonce DIR_BIT: reserved for server handshake
-                            // Check server proof (decrypt with server's full seq including dir bit)
-                            let expected_proof = self
-                                .identity
-                                .read()
-                                .await
-                                .as_ref()
-                                .map(|id| id.reveal_server_proof());
+                && peer_addr == target_addr
+                && len >= 9
+                && buf[0] == SUDP_AUTH_RESP
+            {
+                let recv_seq = u64::from_be_bytes(buf[1..9].try_into().unwrap_or([0u8; 8]));
+                if recv_seq == SUDP_DIR_BIT {
+                    // Server response: all zeros, bit 63 = 1
+                    if let Some(decrypted) =
+                        self.decrypt_payload(&key, SUDP_DIR_BIT, &buf[0..9], &buf[9..len])
+                    {
+                        // Nonce DIR_BIT: reserved for server handshake
+                        // Check server proof (decrypt with server's full seq including dir bit)
+                        let expected_proof = self
+                            .identity
+                            .read()
+                            .await
+                            .as_ref()
+                            .map(|id| id.reveal_server_proof());
 
-                            if let Some(mut expected) = expected_proof {
-                                if decrypted == expected {
-                                    auth_ok = true;
-                                }
-                                expected.zeroize();
-                            } else if !decrypted.is_empty() && decrypted[0] == 1 {
+                        if let Some(mut expected) = expected_proof {
+                            if decrypted == expected {
                                 auth_ok = true;
                             }
-                            stage2_success = true;
-
-                            // 📈 RTO CALIBRATION (Stage 2 ping)
-                            let raw_sample = try_start.elapsed();
-                            // Subtract the Server's mandatory 50ms time-gate from the sample math
-                            let sample = if raw_sample > Duration::from_millis(50) {
-                                raw_sample - Duration::from_millis(50)
-                            } else {
-                                Duration::from_millis(1)
-                            };
-
-                            let current_srtt = srtt.unwrap();
-                            let delta = sample.max(current_srtt) - sample.min(current_srtt);
-                            rttvar = (rttvar.mul_f32(0.75)) + (delta.mul_f32(0.25));
-                            srtt = Some((current_srtt.mul_f32(0.875)) + (sample.mul_f32(0.125)));
-                            dyn_rto = srtt.unwrap() + (rttvar * 4);
-                            dyn_rto = dyn_rto.clamp(
-                                Duration::from_millis(SUDP_RTO_MIN),
-                                Duration::from_millis(SUDP_RTO_MAX),
-                            );
-
-                            break;
+                            expected.zeroize();
+                        } else if !decrypted.is_empty() && decrypted[0] == 1 {
+                            auth_ok = true;
                         }
+                        stage2_success = true;
+
+                        // Update RTT estimation (Stage 2)
+                        let raw_sample = try_start.elapsed();
+                        // Subtract the Server's mandatory 50ms time-gate from the sample math
+                        let sample = if raw_sample > Duration::from_millis(50) {
+                            raw_sample - Duration::from_millis(50)
+                        } else {
+                            Duration::from_millis(1)
+                        };
+
+                        let current_srtt = srtt.unwrap();
+                        let delta = sample.max(current_srtt) - sample.min(current_srtt);
+                        rttvar = (rttvar.mul_f32(0.75)) + (delta.mul_f32(0.25));
+                        srtt = Some((current_srtt.mul_f32(0.875)) + (sample.mul_f32(0.125)));
+                        dyn_rto = srtt.unwrap() + (rttvar * 4);
+                        dyn_rto = dyn_rto.clamp(
+                            Duration::from_millis(SUDP_RTO_MIN),
+                            Duration::from_millis(SUDP_RTO_MAX),
+                        );
+
+                        break;
                     }
                 }
+            }
         }
 
         if !stage2_success {
@@ -629,7 +636,7 @@ impl Engine {
             },
         );
 
-        // Successfully Authenticated! Add to online peers
+        // Authentication successful. Insert session into map.
         let ck = self.derive_cipher_key(&shared_key);
         self.sessions.insert(
             target_addr,
@@ -662,11 +669,11 @@ impl Engine {
             LogLevel::Info,
             LogCategory::Session,
             Some(target_addr),
-            "Connection Established with: {}",
+            "Connection established: {}",
             target_addr
         );
 
-        // 🚀 Start background tasks ONLY AFTER handshake finishes safely
+        // Start background tasks post-handshake
         self.start_background_tasks(Arc::clone(&socket)).await;
 
         let (tx, rx) = mpsc::channel::<Event>(256);
@@ -676,9 +683,10 @@ impl Engine {
             let mut buf = [0u8; 2048];
             while let Ok((len, peer_addr)) = socket.recv_from(&mut buf).await {
                 if let Ok(Some(event)) = engine.process_packet(&socket, peer_addr, &buf, len).await
-                    && tx.send(event).await.is_err() {
-                        break; // Receiver dropped
-                    }
+                    && tx.send(event).await.is_err()
+                {
+                    break; // Receiver dropped
+                }
             }
         });
 
@@ -699,14 +707,14 @@ impl Engine {
         let flags = buf[0];
         let seq = u64::from_be_bytes(buf[1..9].try_into().unwrap_or([0u8; 8]));
 
-        // 🛡️ Security Filter 1: Flag Range Validation
+        // ️ Validate flag range
         if !(SUDP_FLAG_MIN..=SUDP_FLAG_MAX).contains(&flags) {
             slog!(
                 self,
                 LogLevel::Warn,
                 LogCategory::Security,
                 Some(addr),
-                "Invalid flag 0x{:02X} rejected",
+                "Invalid packet flag: 0x{:02X} rejected",
                 flags
             );
             return Ok(None);
@@ -715,7 +723,7 @@ impl Engine {
         let ip = addr.ip();
         let now = Instant::now();
 
-        // 🛡️ Security Filter 2: IP Reputation & Adaptive Blocking
+        // ️ Check IP reputation and apply rate limiting
         if let Some(mut rep) = self.reputations.get_mut(&ip) {
             // Check if currently blocked
             if let Some(blocked_until) = rep.blocked_until {
@@ -725,7 +733,7 @@ impl Engine {
                         LogLevel::Trace,
                         LogCategory::Security,
                         Some(addr),
-                        "Blocked IP dropped ({}s left)",
+                        "Dropped blocked IP ({}s left)",
                         (blocked_until - now).as_secs()
                     );
                     return Ok(None);
@@ -734,7 +742,7 @@ impl Engine {
                 }
             }
 
-            // Handshake Rate Limiting (Flags 01 & 03)
+            // Rate limit handshakes
             if flags == SUDP_INIT || flags == SUDP_AUTH_REQ {
                 if rep.window_start.elapsed().as_secs() >= 60 {
                     rep.window_start = now;
@@ -742,7 +750,7 @@ impl Engine {
                 } else {
                     rep.handshake_count += 1;
                     if rep.handshake_count > SUDP_MAX_HANDSHAKES_PER_MIN {
-                        // 🚩 VIOLATION DETECTED
+                        // Rate limit violation
                         let penalty_mins = (SUDP_INITIAL_BLOCK_MINS * 2u32.pow(rep.offenses))
                             .min(SUDP_MAX_BLOCK_MINS);
 
@@ -754,7 +762,7 @@ impl Engine {
                             LogLevel::Warn,
                             LogCategory::Security,
                             Some(addr),
-                            "Rate limited: blocked for {}min (offense #{})",
+                            "Rate limited peer {}min (offense #{})",
                             penalty_mins,
                             rep.offenses
                         );
@@ -847,153 +855,141 @@ impl Engine {
 
                 if len >= 25
                     && let Some(p) = self.handshakes.get_mut(&addr)
-                        && let Some(shared) = p.shared_secret {
-                            let key = self.derive_cipher_key(&shared);
-                            if let Some(decrypted) =
-                                self.decrypt_payload(&key, 0u64, &buf[0..9], &buf[9..len])
+                    && let Some(shared) = p.shared_secret
+                {
+                    let key = self.derive_cipher_key(&shared);
+                    if let Some(decrypted) =
+                        self.decrypt_payload(&key, 0u64, &buf[0..9], &buf[9..len])
+                    {
+                        // Nonce 0: reserved for client handshake
+                        if !decrypted.is_empty() {
+                            let peer_token = String::from_utf8_lossy(&decrypted).to_string();
+                            let peer_token = peer_token.trim_matches(char::from(0)).to_string(); // Clean null padding
+
+                            let mut auth_ok = false;
+                            if let Some(ref id) = *self.identity.read().await
+                                && id.verify_peer(peer_token.as_bytes())
                             {
-                                // Nonce 0: reserved for client handshake
-                                if !decrypted.is_empty() {
-                                    let peer_token =
-                                        String::from_utf8_lossy(&decrypted).to_string();
-                                    let peer_token =
-                                        peer_token.trim_matches(char::from(0)).to_string(); // Clean null padding
+                                auth_ok = true;
+                            }
 
-                                    let mut auth_ok = false;
-                                    if let Some(ref id) = *self.identity.read().await
-                                        && id.verify_peer(peer_token.as_bytes()) {
-                                            auth_ok = true;
-                                        }
+                            drop(p);
+                            if let Some((_, handshake_data)) = self.handshakes.remove(&addr) {
+                                if auth_ok {
+                                    let ss = handshake_data.shared_secret.unwrap();
+                                    let ck = self.derive_cipher_key(&ss);
+                                    self.sessions.insert(
+                                        addr,
+                                        Session {
+                                            cipher_key: ck,
 
-                                    drop(p);
-                                    if let Some((_, handshake_data)) = self.handshakes.remove(&addr)
-                                    {
-                                        if auth_ok {
-                                            let ss = handshake_data.shared_secret.unwrap();
-                                            let ck = self.derive_cipher_key(&ss);
-                                            self.sessions.insert(
-                                                addr,
-                                                Session {
-                                                    cipher_key: ck,
-
-                                                    socket: Arc::clone(socket),
-                                                    last_activity: Instant::now(),
-                                                    is_server: true, // Server side
-                                                    recovery_started_at: None,
-                                                    next_send_seq: 0,
-                                                    last_recv_seq: 0,
-                                                    recv_window_packets:
-                                                        std::collections::HashMap::new(),
-                                                    recv_window_end_info:
-                                                        std::collections::HashMap::new(),
-                                                    last_acked_window: 0,
-                                                    recv_complete_window: 0,
-                                                    recv_stream_start: None,
-                                                    recv_partial_acks: 0,
-                                                    recv_duplicates: 0,
-                                                    created_at: Instant::now(),
-                                                    total_bytes_sent: 0,
-                                                    total_bytes_received: 0,
-                                                    streams_sent: 0,
-                                                    streams_received: 0,
-                                                },
-                                            );
-                                            slog!(
-                                                self,
-                                                LogLevel::Info,
-                                                LogCategory::Session,
-                                                Some(addr),
-                                                "Session established (server-side)"
-                                            );
-                                        } else {
-                                            slog!(
-                                                self,
-                                                LogLevel::Warn,
-                                                LogCategory::Handshake,
-                                                Some(addr),
-                                                "Auth rejected: invalid peer token"
-                                            );
-                                            let ip_addr = addr.ip();
-                                            if let Some(mut rep) =
-                                                self.reputations.get_mut(&ip_addr)
-                                            {
-                                                let penalty_mins = (SUDP_INITIAL_BLOCK_MINS
-                                                    * 2u32.pow(rep.offenses))
-                                                .min(SUDP_MAX_BLOCK_MINS);
-                                                rep.blocked_until = Some(
-                                                    Instant::now()
-                                                        + Duration::from_secs(
-                                                            penalty_mins as u64 * 60,
-                                                        ),
-                                                );
-                                                rep.offenses += 1;
-                                            }
-                                        }
-
-                                        // 🚀 ASYNC FLAG 04: Unified 50ms Gated Handshake
-                                        let engine = self.clone();
-                                        let socket = Arc::clone(socket);
-                                        let addr_c = addr;
-                                        let seq_c = SUDP_DIR_BIT; // Server handshake seq: all zeros, bit 63 = 1
-                                        let key_c = key;
-
-                                        tokio::spawn(async move {
-                                            // 1. Determine payload
-                                            let mut payload_data = if auth_ok {
-                                                if let Some(id) =
-                                                    engine.identity.read().await.as_ref()
-                                                {
-                                                    id.reveal_server_proof()
-                                                } else {
-                                                    return;
-                                                }
-                                            } else {
-                                                b"invalid_token".to_vec()
-                                            };
-
-                                            // 2. 50ms Time-Gate (Relative to handshake start)
-                                            let elapsed = handshake_start.elapsed();
-                                            if elapsed < Duration::from_millis(50) {
-                                                tokio::time::sleep(
-                                                    Duration::from_millis(50) - elapsed,
-                                                )
-                                                .await;
-                                            }
-
-                                            // 3. Encrypt and Send (with server direction bit)
-                                            let mut resp =
-                                                Vec::with_capacity(9 + payload_data.len() + 16);
-                                            resp.push(SUDP_AUTH_RESP);
-                                            resp.extend_from_slice(&seq_c.to_be_bytes());
-
-                                            let mut ad = [0u8; 9];
-                                            ad[0] = SUDP_AUTH_RESP;
-                                            ad[1..9].copy_from_slice(&seq_c.to_be_bytes());
-
-                                            let encrypted = match engine.encrypt_payload(
-                                                &key_c,
-                                                SUDP_DIR_BIT,
-                                                &ad,
-                                                &payload_data,
-                                            ) {
-                                                Ok(enc) => enc,
-                                                Err(_) => return,
-                                            }; // Nonce DIR_BIT: reserved for server handshake
-                                            resp.extend_from_slice(&encrypted);
-
-                                            let _ = socket.send_to(&resp, addr_c).await;
-
-                                            // 4. Ghost Zeroize
-                                            payload_data.zeroize();
-                                        });
-
-                                        if auth_ok {
-                                            return Ok(Some(Event::Connected));
-                                        }
+                                            socket: Arc::clone(socket),
+                                            last_activity: Instant::now(),
+                                            is_server: true, // Server side
+                                            recovery_started_at: None,
+                                            next_send_seq: 0,
+                                            last_recv_seq: 0,
+                                            recv_window_packets: std::collections::HashMap::new(),
+                                            recv_window_end_info: std::collections::HashMap::new(),
+                                            last_acked_window: 0,
+                                            recv_complete_window: 0,
+                                            recv_stream_start: None,
+                                            recv_partial_acks: 0,
+                                            recv_duplicates: 0,
+                                            created_at: Instant::now(),
+                                            total_bytes_sent: 0,
+                                            total_bytes_received: 0,
+                                            streams_sent: 0,
+                                            streams_received: 0,
+                                        },
+                                    );
+                                    slog!(
+                                        self,
+                                        LogLevel::Info,
+                                        LogCategory::Session,
+                                        Some(addr),
+                                        "Session established (server-side)"
+                                    );
+                                } else {
+                                    slog!(
+                                        self,
+                                        LogLevel::Warn,
+                                        LogCategory::Handshake,
+                                        Some(addr),
+                                        "Auth rejected: invalid peer token"
+                                    );
+                                    let ip_addr = addr.ip();
+                                    if let Some(mut rep) = self.reputations.get_mut(&ip_addr) {
+                                        let penalty_mins = (SUDP_INITIAL_BLOCK_MINS
+                                            * 2u32.pow(rep.offenses))
+                                        .min(SUDP_MAX_BLOCK_MINS);
+                                        rep.blocked_until = Some(
+                                            Instant::now()
+                                                + Duration::from_secs(penalty_mins as u64 * 60),
+                                        );
+                                        rep.offenses += 1;
                                     }
+                                }
+
+                                // Flag 04: Gated Handshake
+                                let engine = self.clone();
+                                let socket = Arc::clone(socket);
+                                let addr_c = addr;
+                                let seq_c = SUDP_DIR_BIT; // Server handshake seq: all zeros, bit 63 = 1
+                                let key_c = key;
+
+                                tokio::spawn(async move {
+                                    // 1. Determine payload
+                                    let mut payload_data = if auth_ok {
+                                        if let Some(id) = engine.identity.read().await.as_ref() {
+                                            id.reveal_server_proof()
+                                        } else {
+                                            return;
+                                        }
+                                    } else {
+                                        b"invalid_token".to_vec()
+                                    };
+
+                                    // 2. 50ms Time-Gate (Relative to handshake start)
+                                    let elapsed = handshake_start.elapsed();
+                                    if elapsed < Duration::from_millis(50) {
+                                        tokio::time::sleep(Duration::from_millis(50) - elapsed)
+                                            .await;
+                                    }
+
+                                    // 3. Encrypt and Send (with server direction bit)
+                                    let mut resp = Vec::with_capacity(9 + payload_data.len() + 16);
+                                    resp.push(SUDP_AUTH_RESP);
+                                    resp.extend_from_slice(&seq_c.to_be_bytes());
+
+                                    let mut ad = [0u8; 9];
+                                    ad[0] = SUDP_AUTH_RESP;
+                                    ad[1..9].copy_from_slice(&seq_c.to_be_bytes());
+
+                                    let encrypted = match engine.encrypt_payload(
+                                        &key_c,
+                                        SUDP_DIR_BIT,
+                                        &ad,
+                                        &payload_data,
+                                    ) {
+                                        Ok(enc) => enc,
+                                        Err(_) => return,
+                                    }; // Nonce DIR_BIT: reserved for server handshake
+                                    resp.extend_from_slice(&encrypted);
+
+                                    let _ = socket.send_to(&resp, addr_c).await;
+
+                                    // 4. Ghost Zeroize
+                                    payload_data.zeroize();
+                                });
+
+                                if auth_ok {
+                                    return Ok(Some(Event::Connected));
                                 }
                             }
                         }
+                    }
+                }
             }
             SUDP_DATA => {
                 if let Some(mut peer) = self.sessions.get_mut(&addr) {
@@ -1002,14 +998,14 @@ impl Engine {
                     if let Some(decrypted_payload) =
                         self.decrypt_payload(&peer.cipher_key, seq, &buf[0..9], &buf[9..len])
                     {
-                        // 🔬 DECODE SEQ FIELDS
+                        // DECODE SEQ FIELDS
                         let sender_dir = seq & SUDP_DIR_BIT; // bit 63
                         let window_idx = (seq & SUDP_SEQ_MASK) >> 7; // bits 7+
                         let packet_pos = ((seq >> 2) & 0x1F) as u8; // bits 6-2 (0-31)
                         let end_window = ((seq >> 1) & 1) == 1; // bit 1
                         let end_stream = (seq & 1) == 1; // bit 0
 
-                        // 🛡️ Direction validation: sender must be the opposite side
+                        // ️ Direction validation: sender must be the opposite side
                         let expected_dir = if peer.is_server { 0u64 } else { SUDP_DIR_BIT };
                         if sender_dir != expected_dir {
                             slog!(
@@ -1024,7 +1020,7 @@ impl Engine {
                             return Ok(None);
                         }
 
-                        // 🛡️ Duplicate rejection: skip packets for already-reassembled windows
+                        // ️ Duplicate rejection: skip packets for already-reassembled windows
                         if window_idx <= peer.recv_complete_window {
                             peer.recv_duplicates += 1;
                             slog!(
@@ -1032,7 +1028,7 @@ impl Engine {
                                 LogLevel::Trace,
                                 LogCategory::Data,
                                 Some(addr),
-                                "Duplicate rejected: window {} <= watermark {}",
+                                "Rejected duplicate packet: window {} <= watermark {}",
                                 window_idx,
                                 peer.recv_complete_window
                             );
@@ -1059,7 +1055,7 @@ impl Engine {
                             decrypted_payload.len()
                         );
 
-                        // 📦 BUFFER: Store payload at (window_idx, packet_pos)
+                        // Buffer incoming payload
                         peer.recv_window_packets
                             .entry(window_idx)
                             .or_insert_with(std::collections::HashMap::new)
@@ -1071,7 +1067,7 @@ impl Engine {
                                 .insert(window_idx, (packet_pos, end_stream));
                         }
 
-                        // 🔍 TRIGGER 2: Detect older windows with missing end_info
+                        // Detect older incomplete windows
                         // Check the CONTIGUOUS range from our lowest buffered window to current.
                         // This catches 100%-lost windows that have zero packets in our buffer.
                         let min_window = peer
@@ -1142,7 +1138,7 @@ impl Engine {
                             }
                         }
 
-                        // 🛰️ ACK CHECK (TRIGGER 1): Trigger if we know this window's end
+                        // ️ ACK CHECK (TRIGGER 1): Trigger if we know this window's end
                         let should_ack = peer.recv_window_end_info.contains_key(&window_idx);
 
                         if should_ack {
@@ -1164,7 +1160,7 @@ impl Engine {
 
                             // Build ACK payload: empty = all good, list = lost seqs
                             let ack_payload = if lost_seqs.is_empty() {
-                                Vec::new() // ✅ Full confirmation
+                                Vec::new() // Full confirmation
                             } else {
                                 let mut payload = Vec::with_capacity(lost_seqs.len() * 8);
                                 for s in &lost_seqs {
@@ -1208,7 +1204,7 @@ impl Engine {
                             }
                         }
 
-                        // 📤 STREAM REASSEMBLY: If end_stream seen + all windows complete
+                        // STREAM REASSEMBLY: If end_stream seen + all windows complete
                         let mut stream_end_window: Option<u64> = None;
                         for (_w_idx, (_end_pos, is_es)) in &peer.recv_window_end_info {
                             if *is_es {
@@ -1244,20 +1240,21 @@ impl Engine {
                             }
 
                             if all_complete {
-                                // 🏁 REASSEMBLE: Concatenate all chunks in order
+                                // REASSEMBLE: Concatenate all chunks in order
                                 let mut full_payload = Vec::new();
                                 for w in first_window..=last_window {
                                     if let Some((ep, _)) = peer.recv_window_end_info.get(&w)
-                                        && let Some(data) = peer.recv_window_packets.get(&w) {
-                                            for p in 0..=*ep {
-                                                if let Some(chunk) = data.get(&p) {
-                                                    full_payload.extend_from_slice(chunk);
-                                                }
+                                        && let Some(data) = peer.recv_window_packets.get(&w)
+                                    {
+                                        for p in 0..=*ep {
+                                            if let Some(chunk) = data.get(&p) {
+                                                full_payload.extend_from_slice(chunk);
                                             }
                                         }
+                                    }
                                 }
 
-                                // 📊 Compute total chunks across all windows
+                                // Compute total chunks across all windows
                                 let mut total_chunks: usize = 0;
                                 for w in first_window..=last_window {
                                     if let Some((ep, _)) = peer.recv_window_end_info.get(&w) {
@@ -1288,7 +1285,7 @@ impl Engine {
                                 peer.recv_stream_start = None;
                                 peer.recv_partial_acks = 0;
                                 peer.recv_duplicates = 0;
-                                // 📊 Update session-level counters
+                                // Update session-level counters
                                 peer.total_bytes_received += total_bytes;
                                 peer.streams_received += 1;
 
@@ -1325,192 +1322,189 @@ impl Engine {
                 if let Some(mut peer) = self.sessions.get_mut(&addr)
                     && let Some(payload) =
                         self.decrypt_payload(&peer.cipher_key, seq, &buf[0..9], &buf[9..len])
-                    {
-                        let acked_window = (seq & SUDP_SEQ_MASK) >> 7; // Strip direction bit
-                        let ip = addr.ip();
-                        let now = Instant::now();
+                {
+                    let acked_window = (seq & SUDP_SEQ_MASK) >> 7; // Strip direction bit
+                    let ip = addr.ip();
+                    let now = Instant::now();
 
-                        // 🩹 ACK received — connection is alive, cancel recovery mode
-                        peer.recovery_started_at = None;
+                    // ACK received — connection is alive, cancel recovery mode
+                    peer.recovery_started_at = None;
 
-                        if payload.is_empty() {
-                            // ✅ FULL ACK: Every packet in this window was received
-                            slog!(
-                                self,
-                                LogLevel::Debug,
-                                LogCategory::Ack,
-                                Some(addr),
-                                "Full ACK received: window {} cleared",
-                                acked_window
-                            );
-                            // Clear all unacked entries belonging to this window
-                            let keys_to_remove: Vec<(SocketAddr, u64)> = self
-                                .unacked
-                                .iter()
-                                .filter(|e| {
-                                    e.key().0 == addr
-                                        && ((e.key().1 & SUDP_SEQ_MASK) >> 7) == acked_window
-                                })
-                                .map(|e| *e.key())
-                                .collect();
-                            for k in keys_to_remove {
-                                self.unacked.remove(&k);
-                            }
-
-                            // Advance last_acked_window (unblocks sender throttle)
-                            if acked_window > peer.last_acked_window {
-                                peer.last_acked_window = acked_window;
-                            }
-                        } else if payload.len() % 8 == 0 {
-                            // ⚠️ PARTIAL ACK: Payload lists the LOST packet seqs
-                            let mut lost_seqs = std::collections::HashSet::new();
-                            for chunk in payload.chunks_exact(8) {
-                                let lost_seq =
-                                    u64::from_be_bytes(chunk.try_into().unwrap_or([0u8; 8]));
-                                lost_seqs.insert(lost_seq);
-                            }
-                            slog!(
-                                self,
-                                LogLevel::Debug,
-                                LogCategory::Ack,
-                                Some(addr),
-                                "Partial ACK received: window {} ({} lost)",
-                                acked_window,
-                                lost_seqs.len()
-                            );
-
-                            // Collect all unacked entries for this window
-                            let window_entries: Vec<(SocketAddr, u64)> = self
-                                .unacked
-                                .iter()
-                                .filter(|e| {
-                                    e.key().0 == addr
-                                        && ((e.key().1 & SUDP_SEQ_MASK) >> 7) == acked_window
-                                })
-                                .map(|e| *e.key())
-                                .collect();
-
-                            // Clear confirmed packets (in this window but NOT in lost list)
-                            for k in &window_entries {
-                                if !lost_seqs.contains(&k.1) {
-                                    self.unacked.remove(k);
-                                }
-                            }
-
-                            // 🚤 Retransmit lost packets immediately
-                            for lost_seq in &lost_seqs {
-                                if let Some(mut pending) = self.unacked.get_mut(&(addr, *lost_seq))
-                                {
-                                    pending.retries += 1;
-                                    pending.sent_at = Instant::now();
-                                    let _ = socket.send_to(&pending.data, addr).await;
-                                }
-                            }
-
-                            // last_acked_window NOT advanced — window still incomplete
-                        }
-
-                        // 📈 RTO CALIBRATION (valid for both full and partial ACKs)
-                        if let Some(mut rep) = self.reputations.get_mut(&ip)
-                            && let Some(last_sent) = rep.last_window_sent_at {
-                                let sample = now.duration_since(last_sent);
-
-                                if let Some(srtt) = rep.srtt {
-                                    // Continuous Smoothing (Alpha=1/8, Beta=1/4)
-                                    let delta = sample.max(srtt) - sample.min(srtt);
-                                    rep.rttvar = (rep.rttvar.mul_f32(0.75)) + (delta.mul_f32(0.25));
-                                    rep.srtt =
-                                        Some((srtt.mul_f32(0.875)) + (sample.mul_f32(0.125)));
-                                } else {
-                                    // First Window Bootstrap
-                                    rep.srtt = Some(sample);
-                                    rep.rttvar = sample / 2;
-                                }
-
-                                // RTO = SRTT + 4 * RTTVAR
-                                let new_rto = rep.srtt.unwrap() + (rep.rttvar * 4);
-                                rep.current_rto = new_rto.clamp(
-                                    Duration::from_millis(SUDP_RTO_MIN),
-                                    Duration::from_millis(SUDP_RTO_MAX),
-                                );
-                                rep.last_window_sent_at = None; // Reset for next window
-                            }
-                    }
-            }
-
-            SUDP_DISCONNECT => {
-                // 🔌 Graceful Disconnect (Flag 06)
-                // seq = dir_bit | SUDP_SEQ_MASK (all 1s) — unique, can never collide with data
-                // Payload = encrypted reason string
-                if let Some(peer) = self.sessions.get_mut(&addr)
-                    && let Some(payload) =
-                        self.decrypt_payload(&peer.cipher_key, seq, &buf[0..9], &buf[9..len])
-                    {
-                        let reason = String::from_utf8_lossy(&payload).to_string();
+                    if payload.is_empty() {
+                        // FULL ACK: Every packet in this window was received
                         slog!(
                             self,
-                            LogLevel::Info,
-                            LogCategory::Disconnect,
+                            LogLevel::Debug,
+                            LogCategory::Ack,
                             Some(addr),
-                            "Peer disconnected: {}",
-                            reason
+                            "Full ACK received: window {} cleared",
+                            acked_window
                         );
-
-                        // Build session snapshot before cleanup
-                        let now = Instant::now();
-                        let session_info = SessionInfo {
-                            peer_addr: addr,
-                            role: if peer.is_server {
-                                SessionRole::Server
-                            } else {
-                                SessionRole::Client
-                            },
-                            uptime: now.duration_since(peer.created_at),
-                            idle: now.duration_since(peer.last_activity),
-                            total_bytes_sent: peer.total_bytes_sent,
-                            total_bytes_received: peer.total_bytes_received,
-                            streams_sent: peer.streams_sent,
-                            streams_received: peer.streams_received,
-                            in_recovery: peer.recovery_started_at.is_some(),
-                        };
-
-                        // 📨 Send ACK for disconnect
-                        let my_dir: u64 = if peer.is_server { SUDP_DIR_BIT } else { 0 };
-                        let ack_seq = my_dir | SUDP_SEQ_MASK;
-                        let mut ad = [0u8; 9];
-                        ad[0] = SUDP_ACK;
-                        ad[1..9].copy_from_slice(&ack_seq.to_be_bytes());
-                        if let Ok(encrypted) =
-                            self.encrypt_payload(&peer.cipher_key, ack_seq, &ad, &[])
-                        {
-                            let mut resp = Vec::with_capacity(9 + encrypted.len());
-                            resp.extend_from_slice(&ad);
-                            resp.extend_from_slice(&encrypted);
-                            let _ = socket.send_to(&resp, addr).await;
-                        }
-
-                        // Drop the lock before cleanup
-                        drop(peer);
-
-                        // 🧹 Clean up all state for this peer
-                        self.sessions.remove(&addr);
+                        // Clear all unacked entries belonging to this window
                         let keys_to_remove: Vec<(SocketAddr, u64)> = self
                             .unacked
                             .iter()
-                            .filter(|e| e.key().0 == addr)
+                            .filter(|e| {
+                                e.key().0 == addr
+                                    && ((e.key().1 & SUDP_SEQ_MASK) >> 7) == acked_window
+                            })
                             .map(|e| *e.key())
                             .collect();
                         for k in keys_to_remove {
                             self.unacked.remove(&k);
                         }
-                        self.handshakes.remove(&addr);
 
-                        return Ok(Some(Event::Disconnected(DisconnectInfo {
-                            peer_addr: addr,
-                            reason,
-                            session: session_info,
-                        })));
+                        // Advance last_acked_window (unblocks sender throttle)
+                        if acked_window > peer.last_acked_window {
+                            peer.last_acked_window = acked_window;
+                        }
+                    } else if payload.len() % 8 == 0 {
+                        // ️ PARTIAL ACK: Payload lists the LOST packet seqs
+                        let mut lost_seqs = std::collections::HashSet::new();
+                        for chunk in payload.chunks_exact(8) {
+                            let lost_seq = u64::from_be_bytes(chunk.try_into().unwrap_or([0u8; 8]));
+                            lost_seqs.insert(lost_seq);
+                        }
+                        slog!(
+                            self,
+                            LogLevel::Debug,
+                            LogCategory::Ack,
+                            Some(addr),
+                            "Partial ACK received: window {} ({} lost)",
+                            acked_window,
+                            lost_seqs.len()
+                        );
+
+                        // Collect all unacked entries for this window
+                        let window_entries: Vec<(SocketAddr, u64)> = self
+                            .unacked
+                            .iter()
+                            .filter(|e| {
+                                e.key().0 == addr
+                                    && ((e.key().1 & SUDP_SEQ_MASK) >> 7) == acked_window
+                            })
+                            .map(|e| *e.key())
+                            .collect();
+
+                        // Clear confirmed packets (in this window but NOT in lost list)
+                        for k in &window_entries {
+                            if !lost_seqs.contains(&k.1) {
+                                self.unacked.remove(k);
+                            }
+                        }
+
+                        // Retransmit lost packets immediately
+                        for lost_seq in &lost_seqs {
+                            if let Some(mut pending) = self.unacked.get_mut(&(addr, *lost_seq)) {
+                                pending.retries += 1;
+                                pending.sent_at = Instant::now();
+                                let _ = socket.send_to(&pending.data, addr).await;
+                            }
+                        }
+
+                        // last_acked_window NOT advanced — window still incomplete
                     }
+
+                    // RTO CALIBRATION (valid for both full and partial ACKs)
+                    if let Some(mut rep) = self.reputations.get_mut(&ip)
+                        && let Some(last_sent) = rep.last_window_sent_at
+                    {
+                        let sample = now.duration_since(last_sent);
+
+                        if let Some(srtt) = rep.srtt {
+                            // Continuous Smoothing (Alpha=1/8, Beta=1/4)
+                            let delta = sample.max(srtt) - sample.min(srtt);
+                            rep.rttvar = (rep.rttvar.mul_f32(0.75)) + (delta.mul_f32(0.25));
+                            rep.srtt = Some((srtt.mul_f32(0.875)) + (sample.mul_f32(0.125)));
+                        } else {
+                            // First Window Bootstrap
+                            rep.srtt = Some(sample);
+                            rep.rttvar = sample / 2;
+                        }
+
+                        // RTO = SRTT + 4 * RTTVAR
+                        let new_rto = rep.srtt.unwrap() + (rep.rttvar * 4);
+                        rep.current_rto = new_rto.clamp(
+                            Duration::from_millis(SUDP_RTO_MIN),
+                            Duration::from_millis(SUDP_RTO_MAX),
+                        );
+                        rep.last_window_sent_at = None; // Reset for next window
+                    }
+                }
+            }
+
+            SUDP_DISCONNECT => {
+                // Graceful disconnect
+                // seq = dir_bit | SUDP_SEQ_MASK (all 1s) — unique, can never collide with data
+                // Payload = encrypted reason string
+                if let Some(peer) = self.sessions.get_mut(&addr)
+                    && let Some(payload) =
+                        self.decrypt_payload(&peer.cipher_key, seq, &buf[0..9], &buf[9..len])
+                {
+                    let reason = String::from_utf8_lossy(&payload).to_string();
+                    slog!(
+                        self,
+                        LogLevel::Info,
+                        LogCategory::Disconnect,
+                        Some(addr),
+                        "Peer disconnected: {}",
+                        reason
+                    );
+
+                    // Build session snapshot before cleanup
+                    let now = Instant::now();
+                    let session_info = SessionInfo {
+                        peer_addr: addr,
+                        role: if peer.is_server {
+                            SessionRole::Server
+                        } else {
+                            SessionRole::Client
+                        },
+                        uptime: now.duration_since(peer.created_at),
+                        idle: now.duration_since(peer.last_activity),
+                        total_bytes_sent: peer.total_bytes_sent,
+                        total_bytes_received: peer.total_bytes_received,
+                        streams_sent: peer.streams_sent,
+                        streams_received: peer.streams_received,
+                        in_recovery: peer.recovery_started_at.is_some(),
+                    };
+
+                    // Send ACK for disconnect
+                    let my_dir: u64 = if peer.is_server { SUDP_DIR_BIT } else { 0 };
+                    let ack_seq = my_dir | SUDP_SEQ_MASK;
+                    let mut ad = [0u8; 9];
+                    ad[0] = SUDP_ACK;
+                    ad[1..9].copy_from_slice(&ack_seq.to_be_bytes());
+                    if let Ok(encrypted) = self.encrypt_payload(&peer.cipher_key, ack_seq, &ad, &[])
+                    {
+                        let mut resp = Vec::with_capacity(9 + encrypted.len());
+                        resp.extend_from_slice(&ad);
+                        resp.extend_from_slice(&encrypted);
+                        let _ = socket.send_to(&resp, addr).await;
+                    }
+
+                    // Drop the lock before cleanup
+                    drop(peer);
+
+                    // Clean up all state for this peer
+                    self.sessions.remove(&addr);
+                    let keys_to_remove: Vec<(SocketAddr, u64)> = self
+                        .unacked
+                        .iter()
+                        .filter(|e| e.key().0 == addr)
+                        .map(|e| *e.key())
+                        .collect();
+                    for k in keys_to_remove {
+                        self.unacked.remove(&k);
+                    }
+                    self.handshakes.remove(&addr);
+
+                    return Ok(Some(Event::Disconnected(DisconnectInfo {
+                        peer_addr: addr,
+                        reason,
+                        session: session_info,
+                    })));
+                }
             }
 
             _ => {}
@@ -1546,7 +1540,7 @@ impl Engine {
                     }
                 });
 
-                // 🧹 DEEP CLEAN: Wipe all pending packets for dead sessions
+                // DEEP CLEAN: Wipe all pending packets for dead sessions
                 for addr in expired {
                     ac_gc_c.retain(|(peer_addr, _), _| *peer_addr != addr);
                 }
@@ -1554,9 +1548,10 @@ impl Engine {
                 // Cleanup Reputation: Only keep blocked IPs or those in an active handshake window
                 rc_gc.retain(|_, r| {
                     if let Some(blocked_until) = r.blocked_until
-                        && now < blocked_until {
-                            return true;
-                        }
+                        && now < blocked_until
+                    {
+                        return true;
+                    }
                     r.window_start.elapsed().as_secs() < SUDP_PEER_TTL
                 });
             }
@@ -1591,9 +1586,10 @@ impl Engine {
                 let mut expired: Vec<SocketAddr> = Vec::new();
                 for entry in oc_re.iter() {
                     if let Some(recovery_start) = entry.recovery_started_at
-                        && recovery_start.elapsed().as_secs() >= 600 {
-                            expired.push(*entry.key());
-                        }
+                        && recovery_start.elapsed().as_secs() >= 600
+                    {
+                        expired.push(*entry.key());
+                    }
                 }
                 for addr in &expired {
                     oc_re.remove(addr);
@@ -1635,7 +1631,7 @@ impl Engine {
                             .unwrap_or(0);
 
                         if min_retries < SUDP_WINDOW_RETRIES {
-                            // 🚤 NORMAL RETRY: Resend only THIS window
+                            // NORMAL RETRY: Resend only THIS window
                             for mut entry in ac_re.iter_mut() {
                                 let ((a, s), pending) = entry.pair_mut();
                                 let w = (*s & SUDP_SEQ_MASK) >> 7;
@@ -1658,7 +1654,7 @@ impl Engine {
                                 rto.as_millis()
                             );
                         } else if recovery_elapsed >= 480 && !any_last_gasp {
-                            // ⚡ LAST GASP (8 minutes): Resend ALL unACKed windows for this peer
+                            // LAST GASP (8 minutes): Resend ALL unACKed windows for this peer
                             for mut entry in ac_re.iter_mut() {
                                 let ((a, _), pending) = entry.pair_mut();
                                 if *a == *addr {
@@ -1720,14 +1716,14 @@ impl Engine {
         cipher.decrypt(nonce, payload).ok()
     }
 
-    /// 🚀 Simple send — returns only success/failure, no metrics.
+    /// Transmits data.
     /// Use `send_data()` for full report or live progress.
     pub async fn send(&self, addr: SocketAddr, data: &[u8]) -> Result<()> {
         self.send_data(addr, data, None).await?;
         Ok(())
     }
 
-    /// 🚀 Full send — returns `SendReport` with metrics.
+    /// Transmits data and returns a SendReport.
     /// Pass a `watch::Sender<SendProgress>` for real-time progress updates.
     ///
     /// # API Tiers
@@ -1753,20 +1749,20 @@ impl Engine {
         let chunk_limit = SUDP_MTU - SUDP_OVERHEAD;
         let total_chunks = total_bytes.div_ceil(chunk_limit);
 
-        // 📊 Metrics
+        // Metrics
         let mut bytes_sent: usize = 0;
         let mut chunks_sent: usize = 0;
         let mut windows_used: u64 = 0;
         let mut throttle_stalls: u32 = 0;
 
-        // 🔑 Derive cipher key once for the entire stream
+        // Derive cipher key once for the entire stream
         let mut key = if let Some(peer) = self.sessions.get(&addr) {
             peer.cipher_key
         } else {
             return Err(anyhow::anyhow!("No active session for target"));
         };
 
-        // 📡 Emit initial progress
+        // Emit initial progress
         if let Some(tx) = &progress_tx {
             let _ = tx.send(SendProgress {
                 total_bytes,
@@ -1862,9 +1858,10 @@ impl Engine {
                     packet.extend_from_slice(&encrypted);
 
                     if is_end_window == 1
-                        && let Some(mut rep) = self.reputations.get_mut(&addr.ip()) {
-                            rep.last_window_sent_at = Some(Instant::now());
-                        }
+                        && let Some(mut rep) = self.reputations.get_mut(&addr.ip())
+                    {
+                        rep.last_window_sent_at = Some(Instant::now());
+                    }
                     (seq, packet)
                 } else {
                     return Err(anyhow::anyhow!("Connection lost during send"));
@@ -1892,11 +1889,11 @@ impl Engine {
                 return Err(e.into());
             }
 
-            // 📊 Update metrics
+            // Update metrics
             bytes_sent += chunk_size;
             chunks_sent += 1;
 
-            // 📡 Emit progress
+            // Emit progress
             if let Some(tx) = &progress_tx {
                 let elapsed = start_time.elapsed();
                 let send_percent = (chunks_sent as f64 / total_chunks as f64) * 100.0;
@@ -1928,10 +1925,10 @@ impl Engine {
 
         let send_elapsed = start_time.elapsed();
 
-        // 🛡️ Zeroize cipher key — no longer needed
+        // ️ Zeroize cipher key — no longer needed
         key.zeroize();
 
-        // 📡 Emit drain phase
+        // Emit drain phase
         if let Some(tx) = &progress_tx {
             let _ = tx.send(SendProgress {
                 total_bytes,
@@ -1949,7 +1946,7 @@ impl Engine {
             });
         }
 
-        // 🛑 STREAM DRAIN: Do not return until every packet for this stream is confirmed
+        // STREAM DRAIN: Do not return until every packet for this stream is confirmed
         // The background retransmit task handles resending lost packets.
         // If session dies (10-min recovery timeout), return error.
         loop {
@@ -1980,7 +1977,7 @@ impl Engine {
             0.0
         };
 
-        // 📡 Emit complete
+        // Emit complete
         if let Some(tx) = &progress_tx {
             let _ = tx.send(SendProgress {
                 total_bytes,
@@ -1998,7 +1995,7 @@ impl Engine {
             });
         }
 
-        // 📊 Update session-level counters
+        // Update session-level counters
         if let Some(mut peer) = self.sessions.get_mut(&addr) {
             peer.total_bytes_sent += total_bytes;
             peer.streams_sent += 1;
@@ -2067,7 +2064,7 @@ impl Engine {
             .collect()
     }
 
-    /// 🔌 Graceful disconnect — sends flag 0x06 with encrypted reason, then cleans up.
+    /// Graceful disconnect — sends flag 0x06 with encrypted reason, then cleans up.
     /// Returns a session snapshot from before cleanup.
     pub async fn disconnect(&self, addr: SocketAddr, reason: &str) -> Result<SessionInfo> {
         let (cipher_key, session_info) = if let Some(peer) = self.sessions.get(&addr) {
@@ -2117,7 +2114,7 @@ impl Engine {
         };
         let _ = socket.send_to(&packet, addr).await;
 
-        // 🧹 Clean up all state immediately
+        // Clean up all state immediately
         self.sessions.remove(&addr);
         let keys_to_remove: Vec<(SocketAddr, u64)> = self
             .unacked

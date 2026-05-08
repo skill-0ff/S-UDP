@@ -3,7 +3,7 @@ use s_udp::{Engine, Event};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 🚀 Initialize the S-UDP Engine
+    // Initialize the engine
     let engine = Engine::new();
 
     // Enable logging to see the protocol internals (handshakes, ACKs, etc.)
@@ -17,7 +17,7 @@ async fn main() -> Result<()> {
     println!("Starting S-UDP Server Example...");
     println!("Listening on 127.0.0.1:5001");
 
-    // 📡 Listen for incoming connections
+    // Listen for incoming connections
     // Arguments: bind_addr, expected_client_token, our_server_token
     let mut rx = engine
         .listen(
@@ -30,10 +30,10 @@ async fn main() -> Result<()> {
     while let Some(event) = rx.recv().await {
         match event {
             Event::Connected => {
-                println!("\n\r[✅] New agent authenticated successfully!");
+                println!("\n\r[] New agent authenticated successfully!");
             }
             Event::Data(report) => {
-                println!("\n\r[📦] Received Data Stream:");
+                println!("\n\r[] Received Data Stream:");
                 println!("  - Size:    {} bytes", report.total_bytes);
                 println!("  - Windows: {}", report.windows_used);
                 println!(
@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
             }
             Event::Disconnected(info) => {
                 println!(
-                    "\n\r[🔌] Peer {} disconnected: {}",
+                    "\n\r[] Peer {} disconnected: {}",
                     info.peer_addr, info.reason
                 );
                 println!(
