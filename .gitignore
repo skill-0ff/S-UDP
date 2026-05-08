@@ -1,0 +1,12 @@
+# Rust
+/target/
+Cargo.lock
+
+# User Rules
+/tmp/
+
+# OS/IDE
+.vscode/
+.idea/
+.DS_Store
+*.rs.bk

@@ -1,0 +1,19 @@
+[package]
+name = "s-udp"
+version = "0.1.0"
+edition = "2024"
+description = "A reliable, encrypted, and windowed UDP protocol implementation in Rust."
+license = "MIT OR Apache-2.0"
+keywords = ["udp", "protocol", "reliable", "encryption", "s-udp"]
+categories = ["network-programming"]
+repository = "https://github.com/skill-0ff/Kinetix-Zero"
+
+[dependencies]
+tokio = { version = "1.37", features = ["full"] }
+zeroize = { version = "1.7", features = ["derive"] }
+dashmap = "5.5"
+anyhow = "1.0"
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+rand = "0.8"
+chacha20poly1305 = "0.10.1"
+sha2 = "0.10"
