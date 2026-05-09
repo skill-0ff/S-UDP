@@ -66,6 +66,23 @@ S-UDP is built to survive in hostile environments:
 
 ---
 
+## 🔍 Diagnostics & Error Channel (Flag 07)
+
+S-UDP includes a dedicated **Error Channel** for transparent session debugging. 
+- **Code 1 (Auth Rejected)**: If the server rejects a token, it immediately sends an encrypted Flag 07 packet containing the rejection reason.
+- **2048-Type Extensibility**: The `packet_idx` field (11 bits) is used as a structured Error Code, allowing for 2047 additional diagnostic types.
+- **Client Transparency**: The `connect` function automatically decrypts and displays the server's error message, eliminating the mystery of failed handshakes.
+
+---
+
+## ⚡ Zero-Gate Handshake
+
+Starting from **v0.2.2**, the mandatory 50ms handshake time-gate has been removed. 
+- **Sub-5ms Establishment**: On low-latency networks (localhost/LAN), sessions are now established instantly.
+- **Nonce Separation**: Handshake control traffic is strictly isolated in `window_idx = 0`, while data traffic (Flag 05) starts at `window_idx = 1`.
+
+---
+
 ## 🚀 Performance Benchmarks
 
 | Feature | S-UDP | Standard UDP | Legacy Reliable UDP |

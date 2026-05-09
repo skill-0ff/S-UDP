@@ -1,3 +1,13 @@
+//! # S-UDP: Smart User Datagram Protocol
+//!
+//! A high-performance, cryptographically secure, and ultra-adaptive reliability layer built on top of UDP.
+//! 
+//! ## Key Features
+//! - **Adaptive High-Throughput**: High-capacity windowing (2048 packets).
+//! - **Congestion Control**: Accelerated growth and proportional shrink logic.
+//! - **Security**: Mutual authentication via ChaCha20-Poly1305 and X25519 forward secrecy.
+//! - **Diagnostics**: Structured Error Channel (Flag 07) for transparent session debugging.
+
 use anyhow::Result;
 use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
@@ -22,6 +32,7 @@ pub const SUDP_AUTH_REQ: u8 = 0x03;
 pub const SUDP_AUTH_RESP: u8 = 0x04;
 pub const SUDP_DATA: u8 = 0x05;
 pub const SUDP_DISCONNECT: u8 = 0x06;
+pub const SUDP_ERROR: u8 = 0x07;
 pub const SUDP_ACK: u8 = 0x08;
 
 // S-UDP Transport Constants
@@ -29,7 +40,7 @@ const SUDP_MTU: usize = 1400;
 const SUDP_OVERHEAD: usize = 25; // 1 (flag) + 8 (seq) + 16 (Poly1305 tag)
 const SUDP_RTO_MIN: u64 = 50;
 const SUDP_RTO_MAX: u64 = 2000;
-const SUDP_RTO_DEFAULT: u64 = 300;
+const SUDP_RTO_DEFAULT: u64 = 2000;
 const SUDP_PEER_TTL: u64 = 600; // 10 Minutes
 const SUDP_HANDSHAKE_TIMEOUT: u64 = 2;
 const SUDP_SESSION_TIMEOUT: u64 = 600; // 10 Minutes
@@ -577,10 +588,10 @@ impl Engine {
                 tokio::time::timeout(dyn_rto, socket.recv_from(&mut buf)).await
                 && peer_addr == target_addr
                 && len >= 9
-                && buf[0] == SUDP_AUTH_RESP
+                && (buf[0] == SUDP_AUTH_RESP || buf[0] == SUDP_ERROR)
             {
                 let recv_seq = u64::from_be_bytes(buf[1..9].try_into().unwrap_or([0u8; 8]));
-                if recv_seq == SUDP_DIR_BIT {
+                if buf[0] == SUDP_AUTH_RESP && recv_seq == SUDP_DIR_BIT {
                     // Server response: all zeros, bit 63 = 1
                     if let Some(decrypted) =
                         self.decrypt_payload(&key, SUDP_DIR_BIT, &buf[0..9], &buf[9..len])
@@ -625,6 +636,15 @@ impl Engine {
 
                         break;
                     }
+                } else if buf[0] == SUDP_ERROR && (recv_seq & 0x07 == 0x07) {
+                    // SERVER ERROR CHANNEL (Flag 07)
+                    if let Some(decrypted) = self.decrypt_payload(&key, recv_seq, &buf[0..9], &buf[9..len]) {
+                        let error_msg = String::from_utf8_lossy(&decrypted).to_string();
+                        let error_code = (recv_seq >> SUDP_PACKET_IDX_SHIFT) & SUDP_PACKET_IDX_MASK;
+                        return Err(anyhow::anyhow!("Server Error (Code {}): {}", error_code, error_msg));
+                    } else {
+                        return Err(anyhow::anyhow!("Server sent an invalid error packet."));
+                    }
                 }
             }
         }
@@ -663,7 +683,7 @@ impl Engine {
                 last_activity: Instant::now(),
                 is_server: false, // Client side
                 recovery_started_at: None,
-                next_send_seq: 0,
+                next_send_seq: 1, // Start at window 1
                 last_recv_seq: 0,
                 recv_window_packets: std::collections::HashMap::new(),
                 recv_window_end_info: std::collections::HashMap::new(),
@@ -850,7 +870,6 @@ impl Engine {
                 }
             }
             SUDP_AUTH_REQ => {
-                let handshake_start = Instant::now();
                 if self.sessions.contains_key(&addr) {
                     let server_seq = SUDP_DIR_BIT; // Server handshake seq: all zeros, bit 63 = 1
                     let mut resp = Vec::with_capacity(25);
@@ -906,7 +925,7 @@ impl Engine {
                                             last_activity: Instant::now(),
                                             is_server: true, // Server side
                                             recovery_started_at: None,
-                                            next_send_seq: 0,
+                                            next_send_seq: 1, // Start at window 1
                                             last_recv_seq: 0,
                                             recv_window_packets: std::collections::HashMap::new(),
                                             recv_window_end_info: std::collections::HashMap::new(),
@@ -957,46 +976,42 @@ impl Engine {
                                 let engine = self.clone();
                                 let socket = Arc::clone(socket);
                                 let addr_c = addr;
-                                let seq_c = SUDP_DIR_BIT; // Server handshake seq: all zeros, bit 63 = 1
                                 let key_c = key;
 
                                 tokio::spawn(async move {
-                                    // 1. Determine payload
-                                    let mut payload_data = if auth_ok {
-                                        if let Some(id) = engine.identity.read().await.as_ref() {
+                                    // 3. Determine Flag and Seq
+                                    let (flag, seq_val, mut payload_data) = if auth_ok {
+                                        let proof = if let Some(id) = engine.identity.read().await.as_ref() {
                                             id.reveal_server_proof()
                                         } else {
                                             return;
-                                        }
+                                        };
+                                        (SUDP_AUTH_RESP, SUDP_DIR_BIT, proof)
                                     } else {
-                                        b"invalid_token".to_vec()
+                                        // Error Channel: Code 1 (Auth Rejected)
+                                        // Seq: Dir(1) | Window(0) | Code(1) | EndW(1) | EndS(1) = 0x8000000000000007
+                                        let err_seq = SUDP_DIR_BIT | (1 << SUDP_PACKET_IDX_SHIFT) | 0x03;
+                                        (SUDP_ERROR, err_seq, b"Auth rejected: invalid peer token".to_vec())
                                     };
 
-                                    // 2. 50ms Time-Gate (Relative to handshake start)
-                                    let elapsed = handshake_start.elapsed();
-                                    if elapsed < Duration::from_millis(50) {
-                                        tokio::time::sleep(Duration::from_millis(50) - elapsed)
-                                            .await;
-                                    }
-
-                                    // 3. Encrypt and Send (with server direction bit)
+                                    // 4. Encrypt and Send
                                     let mut resp = Vec::with_capacity(9 + payload_data.len() + 16);
-                                    resp.push(SUDP_AUTH_RESP);
-                                    resp.extend_from_slice(&seq_c.to_be_bytes());
+                                    resp.push(flag);
+                                    resp.extend_from_slice(&seq_val.to_be_bytes());
 
                                     let mut ad = [0u8; 9];
-                                    ad[0] = SUDP_AUTH_RESP;
-                                    ad[1..9].copy_from_slice(&seq_c.to_be_bytes());
+                                    ad[0] = flag;
+                                    ad[1..9].copy_from_slice(&seq_val.to_be_bytes());
 
                                     let encrypted = match engine.encrypt_payload(
                                         &key_c,
-                                        SUDP_DIR_BIT,
+                                        seq_val,
                                         &ad,
                                         &payload_data,
                                     ) {
                                         Ok(enc) => enc,
                                         Err(_) => return,
-                                    }; // Nonce DIR_BIT: reserved for server handshake
+                                    };
                                     resp.extend_from_slice(&encrypted);
 
                                     let _ = socket.send_to(&resp, addr_c).await;
@@ -1895,11 +1910,13 @@ impl Engine {
 
             let (seq, packet) = {
                 if let Some(mut peer) = self.sessions.get_mut(&addr) {
-                    if packet_idx == 0 {
+                    if packet_idx == 0 && i != 0 {
                         peer.next_send_seq += 1;
-                        windows_used += 1;
                     }
                     let window_idx = peer.next_send_seq;
+                    if packet_idx == 0 {
+                        windows_used += 1;
+                    }
                     let dir_bit: u64 = if peer.is_server { SUDP_DIR_BIT } else { 0 };
 
                     let is_end_stream = i == total_chunks - 1;
