@@ -41,7 +41,7 @@ S-UDP uses a highly optimized bit-packed header for maximum efficiency:
 
 ### Handshake & Session Establishment
 ```mermaid
-sequence_chart
+sequenceDiagram
     participant Client
     participant Server
     Note over Client, Server: X25519 Key Exchange
