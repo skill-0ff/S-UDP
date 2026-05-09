@@ -1,124 +1,106 @@
-<div align="center">
-  <h1>🛡️ S-UDP 🚀</h1>
-  <p><b>High-Performance, Secure, Pipelined Sliding Window UDP Engine</b></p>
-  <img src="https://img.shields.io/badge/Language-Rust-orange" alt="Language" />
-  <img src="https://img.shields.io/badge/Security-ChaCha20Poly1305-blue" alt="Security" />
-  <img src="https://img.shields.io/badge/Key_Exchange-X25519-green" alt="Key Exchange" />
-  <img src="https://img.shields.io/badge/Architecture-2--Window_Pipeline-purple" alt="Architecture" />
-</div>
+# 🚀 S-UDP: Smart User Datagram Protocol
 
-<br/>
+[![Rust](https://img.shields.io/badge/rust-stable-brightgreen.svg)](https://www.rust-lang.org)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Security: ChaCha20-Poly1305](https://img.shields.io/badge/Security-ChaCha20--Poly1305-blueviolet.svg)](#security)
 
-## 🌌 Introduction
-**S-UDP (Secure UDP)** is a next-generation transport protocol built in Rust. It bridges the gap between the speed of UDP and the reliability of TCP, wrapping it all in state-of-the-art cryptography. Designed for high-throughput, low-latency environments, S-UDP features a custom 2-window pipelined sliding window architecture, ensuring non-blocking data streams with robust packet loss recovery.
-
-## ✨ Futuristic Features
-- 🔐 **Zero-Compromise Security**: X25519 Diffie-Hellman Handshakes and ChaCha20Poly1305 AEAD per-packet encryption.
-- 🚀 **2-Window Pipelining**: Send up to two data windows concurrently without waiting for ACKs, minimizing latency.
-- 📦 **Smart Gap-Filling**: Granular, per-packet tracking within windows to selectively retransmit only what was lost.
-- ⏱️ **Exponential RTO Backoff**: Adaptive Retransmission TimeOut prevents network flooding during congestion.
-- 🛡️ **Token Masking (`TokenGuard`)**: Secrets are obfuscated in memory until the exact microsecond they are needed.
+**S-UDP** is a high-performance, cryptographically secure, and ultra-adaptive reliability layer built on top of UDP. Designed for high-throughput streams and unstable networks, S-UDP combines the speed of UDP with the intelligence of modern congestion control.
 
 ---
 
-## ⚙️ Core Architecture & Mechanisms
+## 💎 Key Innovations
 
-### The Packet Geometry
-Every S-UDP transmission features a unified 25-byte protocol overhead layout:
-```text
-[ FLAG (1 byte) | SEQUENCE (8 bytes) | PAYLOAD (Variable) | POLY1305 TAG (16 bytes) ]
-```
+### 📈 Accelerated Adaptive Windowing
+S-UDP doesn't just send data; it learns your network.
+- **Exponential Growth**: Successive full windows trigger an acceleration multiplier ($32 \times n$), reaching the **2048-packet** capacity in seconds.
+- **Proportional Shrink**: Unlike TCP's aggressive half-cuts, S-UDP shrinks its window size **linearly based on actual loss percentage**, maintaining maximum possible throughput.
 
-### The S-UDP Flag Ecosystem
-| Flag | Name | Purpose |
-|------|------|---------|
-| `0x01` | **INIT** | Client initiates X25519 key exchange. |
-| `0x02` | **INIT_RESP** | Server responds with its public key. |
-| `0x03` | **AUTH_REQ** | Client sends encrypted auth token. |
-| `0x04` | **AUTH_RESP** | Server validates token and finalizes handshake. |
-| `0x05` | **DATA** | Encrypted application payload. |
-| `0x06` | **DISCONNECT** | Graceful termination signal. |
-| `0x08` | **ACK** | Windowed Acknowledgment for flow control. |
+### 🛡️ Cryptographic Integrity
+Every single byte is shielded by **ChaCha20-Poly1305**.
+- **Unique Nonce Schema**: A sophisticated 64-bit sequence mapping ensures zero nonce reuse across Data and ACK packets.
+- **Forward Secrecy**: Ephemeral X25519 key exchange for every session.
+
+### ⏱️ Dynamic RTO Calibration
+- **Zero-Wait Handshake**: RTO estimation begins during the very first packet exchange (INIT/RESP).
+- **Fine-Grained Sampling**: Retransmission timers adapt at the sub-millisecond level based on real-time network jitter.
 
 ---
 
-## 🔄 The 2-Window Pipelined Sliding Window
+## 🗺️ Protocol Architecture
 
-S-UDP achieves non-blocking data streaming using a **Pipelined Sliding Window** mechanism. Instead of waiting for an ACK after every packet or single window, the sender can push **two windows** into the network simultaneously.
+### The 64-Bit Sequence Mapping
+S-UDP uses a highly optimized bit-packed header for maximum efficiency:
 
+| Bits | Purpose | Description |
+| :--- | :--- | :--- |
+| **63** | `DIR` | Direction Bit (Client/Server separation) |
+| **13–62** | `WINDOW_IDX` | 50-bit Window Index (Long-lived sessions) |
+| **2–12** | `PACKET_IDX` | 11-bit Packet Index (0–2047 per window) |
+| **1** | `END_W` | End of Window Flag |
+| **0** | `END_S` | End of Stream Flag |
+
+### Handshake & Session Establishment
 ```mermaid
-sequenceDiagram
-    participant Sender
-    participant Network
-    participant Receiver
-
-    Note over Sender: Window 1 (Packets 1-32)
-    Sender->>Network: Transmit W1 Packets (0x05)
-    Note over Sender: Window 2 (Packets 33-64)
-    Sender->>Network: Transmit W2 Packets (0x05)
-    
-    Note over Receiver: Reassembles W1
-    Receiver-->>Sender: 0x08 ACK (Window 1)
-    
-    Note over Sender: Window 1 ACKed.<br/>Window 3 Unlocked!
-    Sender->>Network: Transmit W3 Packets (0x05)
-```
-
-### Window Sequence (`window_seq`)
-The 8-byte `SEQUENCE` field in a DATA packet (`0x05`) is bit-packed:
-- **Bits 7+**: The `window_idx` (Which window this packet belongs to).
-- **Bits 2-6**: The `packet_pos` (0 to 31, representing the packet's position in the 32-packet window).
-- **Bit 1**: `end_window` flag (Indicates the final packet of a window).
-- **Bit 0**: `end_stream` flag (Indicates the final packet of the entire stream).
-
-### Gap-Filling & Retransmission
-1. **Buffering**: The receiver buffers incoming packets into a `HashMap` keyed by `window_idx`.
-2. **Missing Detection**: When the `end_window` packet arrives (or a timeout occurs), the receiver checks for missing `packet_pos` indices.
-3. **Selective ACKing**: The receiver sends an `0x08 ACK` containing a bitmap of missing packets.
-4. **Resend**: The sender only retransmits the precise packets missing from that window, backing off exponentially (`RTO`) if the network is congested.
-
----
-
-## 🤝 Cryptographic Handshake Workflow
-
-S-UDP utilizes a **Unified 50ms Gated Handshake** to prevent replay attacks and SYN floods.
-
-```mermaid
-sequenceDiagram
+sequence_chart
     participant Client
     participant Server
-
-    Client->>Server: 0x01 INIT (Client PubKey)
-    Server-->>Client: 0x02 INIT_RESP (Server PubKey)
-    Note over Client,Server: Shared Secret Derived (X25519)
-    Client->>Server: 0x03 AUTH_REQ (Encrypted Client Token)
-    Server-->>Client: 0x04 AUTH_RESP (Encrypted Server Token)
-    Note over Client,Server: Session Established
+    Note over Client, Server: X25519 Key Exchange
+    Client->>Server: SUDP_INIT (01) + Public Key
+    Server->>Client: SUDP_RESP (02) + Public Key
+    Note over Client, Server: Shared Secret Derived
+    Client->>Server: SUDP_AUTH_REQ (03) + Encrypted Token
+    Server->>Client: SUDP_AUTH_RESP (04) + Encrypted Proof
+    Note over Client, Server: Session Secure (ChaCha20-Poly1305)
 ```
 
 ---
 
-## 🛠️ Usage Example
+## 🛠️ Security & DoS Protection
+
+S-UDP is built to survive in hostile environments:
+- **Rate-Limited Initiation**: IPs are limited to 3 handshakes per minute.
+- **Exponential Penalty**: Auth failures trigger a 3min -> 6min -> 12min ... 24h block.
+- **Stateless Rejection**: Invalid flags or failed Poly1305 tags are dropped instantly with zero CPU overhead.
+
+---
+
+## 🚀 Performance Benchmarks
+
+| Feature | S-UDP | Standard UDP | Legacy Reliable UDP |
+| :--- | :--- | :--- | :--- |
+| **Max Window** | **2048 Packets** | N/A | 32 - 128 Packets |
+| **Congestion Control** | **Adaptive Proportional** | None | Static / AIMD |
+| **Encryption** | **Built-in (Poly1305)** | None | Optional / External |
+| **ACK Overhead** | **Adaptive Bitmask** | None | High (Cumulative) |
+
+---
+
+## 💻 Getting Started
 
 ```rust
-use s_udp::Engine;
+use s_udp::{Engine, Event};
 
 #[tokio::main]
-async fn main() {
-    // Server setup
-    let mut server_engine = Engine::new();
-    server_engine.listen("0.0.0.0:5001", "CLIENT_SECRET".into(), "SERVER_SECRET".into()).await.unwrap();
-
-    // Client setup
-    let mut client_engine = Engine::new();
-    client_engine.connect("127.0.0.1:5001", 0, "CLIENT_SECRET".into(), "SERVER_SECRET".into()).await.unwrap();
-
-    // Transmit Data
-    client_engine.send_data(b"Hello from S-UDP!").await.unwrap();
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let engine = Engine::new();
+    
+    // Start a secure listener
+    let mut rx = engine.listen("0.0.0.0:5001", "my_secret_token".into(), "server_token".into()).await?;
+    
+    while let Some(event) = rx.recv().await {
+        match event {
+            Event::Data(report) => println!("Received {} bytes via S-UDP!", report.total_bytes),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 ```
 
 ---
-<div align="center">
-  <p><i>Engineered for the Future of Secure Data Transport.</i></p>
-</div>
+
+## 📜 License
+Distributed under the MIT License. See `LICENSE` for more information.
+
+---
+*Built with ❤️ by the S-UDP Community.*

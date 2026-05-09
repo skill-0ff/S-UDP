@@ -27,19 +27,29 @@ pub const SUDP_ACK: u8 = 0x08;
 // S-UDP Transport Constants
 const SUDP_MTU: usize = 1400;
 const SUDP_OVERHEAD: usize = 25; // 1 (flag) + 8 (seq) + 16 (Poly1305 tag)
-const SUDP_RETRANSMIT_MS: u64 = 300;
 const SUDP_RTO_MIN: u64 = 50;
 const SUDP_RTO_MAX: u64 = 2000;
-const SUDP_RTO_DEFAULT: u64 = 500;
+const SUDP_RTO_DEFAULT: u64 = 300;
 const SUDP_PEER_TTL: u64 = 600; // 10 Minutes
 const SUDP_HANDSHAKE_TIMEOUT: u64 = 2;
 const SUDP_SESSION_TIMEOUT: u64 = 600; // 10 Minutes
-const SUDP_WINDOW_SIZE: u32 = 32;
+const SUDP_MAX_WINDOW_SIZE: u32 = 2048;
 const SUDP_WINDOW_RETRIES: u32 = 5;
 
 // S-UDP Direction Bit: Separates client/server nonce spaces
 const SUDP_DIR_BIT: u64 = 1u64 << 63;
 const SUDP_SEQ_MASK: u64 = !(1u64 << 63);
+
+// S-UDP Sequence Mapping (64-bit)
+// [63] - Direction Bit
+// [13-62] - Window Index (50 bits)
+// [2-12] - Packet Index (11 bits, max 2048 packets per window)
+// [1] - End Window Flag
+// [0] - End Stream Flag
+const SUDP_PACKET_IDX_BITS: u32 = 11;
+const SUDP_PACKET_IDX_SHIFT: u32 = 2;
+const SUDP_PACKET_IDX_MASK: u64 = (1 << SUDP_PACKET_IDX_BITS) - 1;
+const SUDP_WINDOW_IDX_SHIFT: u32 = SUDP_PACKET_IDX_SHIFT + SUDP_PACKET_IDX_BITS; // 13
 
 // S-UDP Reserved Nonce Space:
 // Handshake encryption (03/04) uses nonce 0 (client) and DIR_BIT (server).
@@ -152,9 +162,11 @@ struct Session {
     next_send_seq: u64,
     last_recv_seq: u64,
     // Receiver: per-window packet buffer
-    recv_window_packets: std::collections::HashMap<u64, std::collections::HashMap<u8, Vec<u8>>>,
+    recv_window_packets: std::collections::HashMap<u64, std::collections::HashMap<u16, Vec<u8>>>,
     // Receiver: window_idx → (last_pos, is_end_stream) — set when end_window packet arrives
-    recv_window_end_info: std::collections::HashMap<u64, (u8, bool)>,
+    recv_window_end_info: std::collections::HashMap<u64, (u16, bool)>,
+    // Receiver: window_idx → count of ACKs sent (for nonce uniqueness)
+    recv_window_ack_count: std::collections::HashMap<u64, u16>,
     last_acked_window: u64,
     // Receiver: highest window fully reassembled (duplicate rejection)
     recv_complete_window: u64,
@@ -166,8 +178,12 @@ struct Session {
     created_at: Instant,
     total_bytes_sent: usize,
     total_bytes_received: usize,
-    streams_sent: u32,
-    streams_received: u32,
+    pub streams_sent: u64,
+    pub streams_received: u64,
+
+    // ADAPTIVE WINDOW SCALING
+    pub current_window_size: u32,
+    pub consecutive_success: u32,
 }
 
 /// Events emitted by the S-UDP engine via the listener or connection stream.
@@ -278,9 +294,9 @@ pub struct SessionInfo {
     /// Total bytes received across all streams in this session
     pub total_bytes_received: usize,
     /// Number of completed send_data calls
-    pub streams_sent: u32,
+    pub streams_sent: u64,
     /// Number of fully reassembled receive streams
-    pub streams_received: u32,
+    pub streams_received: u64,
     /// Whether the session is in recovery mode
     pub in_recovery: bool,
 }
@@ -651,6 +667,7 @@ impl Engine {
                 last_recv_seq: 0,
                 recv_window_packets: std::collections::HashMap::new(),
                 recv_window_end_info: std::collections::HashMap::new(),
+                recv_window_ack_count: std::collections::HashMap::new(),
                 last_acked_window: 0,
                 recv_complete_window: 0,
                 recv_stream_start: None,
@@ -661,6 +678,8 @@ impl Engine {
                 total_bytes_received: 0,
                 streams_sent: 0,
                 streams_received: 0,
+                current_window_size: 128, // Start at 128
+                consecutive_success: 1,
             },
         );
 
@@ -891,6 +910,7 @@ impl Engine {
                                             last_recv_seq: 0,
                                             recv_window_packets: std::collections::HashMap::new(),
                                             recv_window_end_info: std::collections::HashMap::new(),
+                                            recv_window_ack_count: std::collections::HashMap::new(),
                                             last_acked_window: 0,
                                             recv_complete_window: 0,
                                             recv_stream_start: None,
@@ -901,6 +921,8 @@ impl Engine {
                                             total_bytes_received: 0,
                                             streams_sent: 0,
                                             streams_received: 0,
+                                            current_window_size: 128,
+                                            consecutive_success: 1,
                                         },
                                     );
                                     slog!(
@@ -1000,8 +1022,10 @@ impl Engine {
                     {
                         // DECODE SEQ FIELDS
                         let sender_dir = seq & SUDP_DIR_BIT; // bit 63
-                        let window_idx = (seq & SUDP_SEQ_MASK) >> 7; // bits 7+
-                        let packet_pos = ((seq >> 2) & 0x1F) as u8; // bits 6-2 (0-31)
+                        
+                        let window_idx = (seq & SUDP_SEQ_MASK) >> SUDP_WINDOW_IDX_SHIFT; // bits 13+
+                        let packet_pos = ((seq >> SUDP_PACKET_IDX_SHIFT) & SUDP_PACKET_IDX_MASK) as u16; // bits 2-12 (0-2047)
+                        
                         let end_window = ((seq >> 1) & 1) == 1; // bit 1
                         let end_stream = (seq & 1) == 1; // bit 0
 
@@ -1085,55 +1109,46 @@ impl Engine {
                                 continue;
                             }
 
-                            // Sender moved past this window → it was full
-                            peer.recv_window_end_info
-                                .insert(old_w, ((SUDP_WINDOW_SIZE - 1) as u8, false));
-
-                            // Build ACK — find what's missing
-                            let mut old_lost: Vec<u64> = Vec::new();
+                            // Build Bitmask ACK for missing window
+                            let mut ack_payload = vec![0u8; (SUDP_PACKET_IDX_MASK >> 3) as usize + 1];
                             let old_data = peer.recv_window_packets.get(&old_w);
-                            for p in 0..=(SUDP_WINDOW_SIZE - 1) as u8 {
-                                let have = old_data.is_some_and(|d| d.contains_key(&p));
-                                if !have {
-                                    old_lost.push(sender_dir | (old_w << 7) | ((p as u64) << 2));
+                            let mut lost_count = 0;
+                            for p in 0..=SUDP_PACKET_IDX_MASK as u16 {
+                                if old_data.is_some_and(|d| d.contains_key(&p)) {
+                                    ack_payload[(p >> 3) as usize] |= 1 << (p & 7);
+                                } else {
+                                    lost_count += 1;
                                 }
                             }
 
-                            let old_ack_payload = if old_lost.is_empty() {
-                                Vec::new()
-                            } else {
-                                let mut pl = Vec::with_capacity(old_lost.len() * 8);
-                                for s in &old_lost {
-                                    pl.extend_from_slice(&s.to_be_bytes());
-                                }
-                                pl
-                            };
+                            // Increment ACK count for this window (unique nonce)
+                            let ack_count = peer.recv_window_ack_count.entry(old_w).or_insert(0);
+                            let current_ack_count = *ack_count;
+                            *ack_count = (*ack_count + 1) & SUDP_PACKET_IDX_MASK as u16;
 
-                            let old_ack_seq = my_dir | (old_w << 7) | 0b01;
+                            let old_ack_seq = my_dir | (old_w << SUDP_WINDOW_IDX_SHIFT) | ((current_ack_count as u64) << SUDP_PACKET_IDX_SHIFT) | 0b01;
                             let mut old_ad = [0u8; 9];
                             old_ad[0] = SUDP_ACK;
                             old_ad[1..9].copy_from_slice(&old_ack_seq.to_be_bytes());
 
-                            let old_enc = self.encrypt_payload(
-                                &peer.cipher_key,
-                                old_ack_seq,
-                                &old_ad,
-                                &old_ack_payload,
-                            )?;
+                            let old_enc = self.encrypt_payload(&peer.cipher_key, old_ack_seq, &old_ad, &ack_payload)?;
                             let mut old_resp = Vec::with_capacity(9 + old_enc.len());
                             old_resp.extend_from_slice(&old_ad);
                             old_resp.extend_from_slice(&old_enc);
                             let _ = socket.send_to(&old_resp, addr).await;
-                            if !old_lost.is_empty() {
+                            
+                            if lost_count > 0 {
                                 peer.recv_partial_acks += 1;
                                 slog!(
                                     self,
                                     LogLevel::Debug,
                                     LogCategory::Ack,
                                     Some(addr),
-                                    "Gap ACK sent: window {} ({} lost)",
+                                    "Gap Bitmask ACK sent: window {} ({} missing) seq={:016X} len={}",
                                     old_w,
-                                    old_lost.len()
+                                    lost_count,
+                                    old_ack_seq,
+                                    ack_payload.len()
                                 );
                             }
                         }
@@ -1146,51 +1161,55 @@ impl Engine {
                                 *peer.recv_window_end_info.get(&window_idx).unwrap();
                             let received = peer.recv_window_packets.get(&window_idx);
 
-                            // Find missing positions
-                            let mut lost_seqs: Vec<u64> = Vec::new();
+                            // Build Bitmask ACK
+                            let mut ack_payload = vec![0u8; (end_pos >> 3) as usize + 1];
+                            let mut lost_count = 0;
                             if let Some(window_data) = received {
                                 for p in 0..=end_pos {
-                                    if !window_data.contains_key(&p) {
-                                        let lost =
-                                            sender_dir | (window_idx << 7) | ((p as u64) << 2);
-                                        lost_seqs.push(lost);
+                                    if window_data.contains_key(&p) {
+                                        ack_payload[(p >> 3) as usize] |= 1 << (p & 7);
+                                    } else {
+                                        lost_count += 1;
                                     }
                                 }
+                            } else {
+                                lost_count = end_pos + 1;
                             }
 
-                            // Build ACK payload: empty = all good, list = lost seqs
-                            let ack_payload = if lost_seqs.is_empty() {
-                                Vec::new() // Full confirmation
-                            } else {
-                                let mut payload = Vec::with_capacity(lost_seqs.len() * 8);
-                                for s in &lost_seqs {
-                                    payload.extend_from_slice(&s.to_be_bytes());
-                                }
-                                payload
-                            };
+                            // FULL ACK Shortcut: If all packets received, send empty payload
+                            if lost_count == 0 {
+                                ack_payload.clear();
+                            }
 
-                            let ack_seq = my_dir | (window_idx << 7) | 0b01;
+                            // Increment ACK count for this window (unique nonce)
+                            let ack_count = peer.recv_window_ack_count.entry(window_idx).or_insert(0);
+                            let current_ack_count = *ack_count;
+                            *ack_count = (*ack_count + 1) & SUDP_PACKET_IDX_MASK as u16;
+
+                            let ack_seq = my_dir | (window_idx << SUDP_WINDOW_IDX_SHIFT) | ((current_ack_count as u64) << SUDP_PACKET_IDX_SHIFT) | 0b01;
 
                             let mut ad = [0u8; 9];
                             ad[0] = SUDP_ACK;
                             ad[1..9].copy_from_slice(&ack_seq.to_be_bytes());
 
-                            let encrypted =
-                                self.encrypt_payload(&peer.cipher_key, ack_seq, &ad, &ack_payload)?;
+                            let encrypted = self.encrypt_payload(&peer.cipher_key, ack_seq, &ad, &ack_payload)?;
                             let mut resp = Vec::with_capacity(9 + encrypted.len());
                             resp.extend_from_slice(&ad);
                             resp.extend_from_slice(&encrypted);
                             let _ = socket.send_to(&resp, addr).await;
-                            if !lost_seqs.is_empty() {
+
+                            if lost_count > 0 {
                                 peer.recv_partial_acks += 1;
                                 slog!(
                                     self,
                                     LogLevel::Debug,
                                     LogCategory::Ack,
                                     Some(addr),
-                                    "Partial ACK sent: window {} ({} lost)",
+                                    "Partial Bitmask ACK sent: window {} ({} missing) seq={:016X} len={}",
                                     window_idx,
-                                    lost_seqs.len()
+                                    lost_count,
+                                    ack_seq,
+                                    ack_payload.len()
                                 );
                             } else {
                                 slog!(
@@ -1198,8 +1217,9 @@ impl Engine {
                                     LogLevel::Debug,
                                     LogCategory::Ack,
                                     Some(addr),
-                                    "Full ACK sent: window {}",
-                                    window_idx
+                                    "Full ACK sent: window {} seq={:016X}",
+                                    window_idx,
+                                    ack_seq
                                 );
                             }
                         }
@@ -1217,8 +1237,9 @@ impl Engine {
                             // Determine the first expected window in this stream
                             let first_window = peer.recv_complete_window + 1;
 
-                            // Check CONTIGUOUS range: every window from first to last must be complete
-                            let mut all_complete = true;
+                            if first_window <= last_window {
+                                // Check CONTIGUOUS range: every window from first to last must be complete
+                                let mut all_complete = true;
                             for w in first_window..=last_window {
                                 if let Some((ep, _)) = peer.recv_window_end_info.get(&w) {
                                     if let Some(data) = peer.recv_window_packets.get(&w) {
@@ -1315,7 +1336,8 @@ impl Engine {
                     }
                 }
             }
-            SUDP_ACK => {
+        }
+        SUDP_ACK => {
                 // S-UDP Windowed ACK (Flag 08)
                 // Payload empty  = all packets received (full confirmation)
                 // Payload present = list of LOST packet seqs (8 bytes each)
@@ -1323,7 +1345,7 @@ impl Engine {
                     && let Some(payload) =
                         self.decrypt_payload(&peer.cipher_key, seq, &buf[0..9], &buf[9..len])
                 {
-                    let acked_window = (seq & SUDP_SEQ_MASK) >> 7; // Strip direction bit
+                    let acked_window = (seq & SUDP_SEQ_MASK) >> SUDP_WINDOW_IDX_SHIFT; // Strip direction bit
                     let ip = addr.ip();
                     let now = Instant::now();
 
@@ -1346,7 +1368,7 @@ impl Engine {
                             .iter()
                             .filter(|e| {
                                 e.key().0 == addr
-                                    && ((e.key().1 & SUDP_SEQ_MASK) >> 7) == acked_window
+                                    && ((e.key().1 & SUDP_SEQ_MASK) >> SUDP_WINDOW_IDX_SHIFT) == acked_window
                             })
                             .map(|e| *e.key())
                             .collect();
@@ -1358,22 +1380,10 @@ impl Engine {
                         if acked_window > peer.last_acked_window {
                             peer.last_acked_window = acked_window;
                         }
-                    } else if payload.len() % 8 == 0 {
-                        // ️ PARTIAL ACK: Payload lists the LOST packet seqs
-                        let mut lost_seqs = std::collections::HashSet::new();
-                        for chunk in payload.chunks_exact(8) {
-                            let lost_seq = u64::from_be_bytes(chunk.try_into().unwrap_or([0u8; 8]));
-                            lost_seqs.insert(lost_seq);
-                        }
-                        slog!(
-                            self,
-                            LogLevel::Debug,
-                            LogCategory::Ack,
-                            Some(addr),
-                            "Partial ACK received: window {} ({} lost)",
-                            acked_window,
-                            lost_seqs.len()
-                        );
+                    } else {
+                        // ️ BITMASK ACK: Payload bits indicate received packets
+                        let mut lost_count = 0;
+                        let mut acked_count = 0;
 
                         // Collect all unacked entries for this window
                         let window_entries: Vec<(SocketAddr, u64)> = self
@@ -1381,28 +1391,80 @@ impl Engine {
                             .iter()
                             .filter(|e| {
                                 e.key().0 == addr
-                                    && ((e.key().1 & SUDP_SEQ_MASK) >> 7) == acked_window
+                                    && ((e.key().1 & SUDP_SEQ_MASK) >> SUDP_WINDOW_IDX_SHIFT) == acked_window
                             })
                             .map(|e| *e.key())
                             .collect();
 
-                        // Clear confirmed packets (in this window but NOT in lost list)
-                        for k in &window_entries {
-                            if !lost_seqs.contains(&k.1) {
-                                self.unacked.remove(k);
+                        for (addr, seq) in window_entries {
+                            let packet_idx = ((seq >> SUDP_PACKET_IDX_SHIFT) & SUDP_PACKET_IDX_MASK) as usize;
+                            let byte_idx = packet_idx >> 3;
+                            let bit_idx = packet_idx & 7;
+
+                            let mut received = false;
+                            if byte_idx < payload.len() {
+                                received = (payload[byte_idx] & (1 << bit_idx)) != 0;
+                            }
+
+                            if received {
+                                self.unacked.remove(&(addr, seq));
+                                acked_count += 1;
+                            } else {
+                                // Retransmit lost packet
+                                if let Some(mut pending) = self.unacked.get_mut(&(addr, seq)) {
+                                    pending.retries += 1;
+                                    pending.sent_at = Instant::now();
+                                    let _ = socket.send_to(&pending.data, addr).await;
+                                    lost_count += 1;
+                                }
                             }
                         }
 
-                        // Retransmit lost packets immediately
-                        for lost_seq in &lost_seqs {
-                            if let Some(mut pending) = self.unacked.get_mut(&(addr, *lost_seq)) {
-                                pending.retries += 1;
-                                pending.sent_at = Instant::now();
-                                let _ = socket.send_to(&pending.data, addr).await;
+                        slog!(
+                            self,
+                            LogLevel::Debug,
+                            LogCategory::Ack,
+                            Some(addr),
+                            "Bitmask ACK: window {} ({} acked, {} retransmitted) seq={:016X} len={}",
+                            acked_window,
+                            acked_count,
+                            lost_count,
+                            seq,
+                            payload.len()
+                        );
+
+                        // DYNAMIC WINDOW SCALING
+                        if payload.is_empty() {
+                            // 0% LOSS: Accelerated Growth
+                            let growth = 32 * peer.consecutive_success;
+                            if (SUDP_MAX_WINDOW_SIZE - peer.current_window_size) < growth {
+                                peer.current_window_size = SUDP_MAX_WINDOW_SIZE;
+                            } else {
+                                peer.current_window_size += growth;
+                                peer.consecutive_success += 1;
+                            }
+                        } else {
+                            // > 0% LOSS: Proportional Shrink
+                            peer.consecutive_success = 1; // Reset accelerator
+                            
+                            // Calculate loss percentage based on the unacked entries we just checked
+                            let total_tracked = acked_count + lost_count;
+                            if total_tracked > 0 {
+                                let loss_ratio = lost_count as f32 / total_tracked as f32;
+                                let shrink_factor = 1.0 - loss_ratio;
+                                peer.current_window_size = ((peer.current_window_size as f32 * shrink_factor) as u32).max(32);
                             }
                         }
 
-                        // last_acked_window NOT advanced — window still incomplete
+                        slog!(
+                            self,
+                            LogLevel::Debug,
+                            LogCategory::Session,
+                            Some(addr),
+                            "Adaptive Window: {} (consecutive_success: {})",
+                            peer.current_window_size,
+                            peer.consecutive_success
+                        );
                     }
 
                     // RTO CALIBRATION (valid for both full and partial ACKs)
@@ -1565,7 +1627,7 @@ impl Engine {
         let engine_re = self.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_millis(SUDP_RETRANSMIT_MS)).await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
 
                 // Group pending packets by (addr, window_idx) — scoped retransmit
                 type RetransmitGroups =
@@ -1573,7 +1635,7 @@ impl Engine {
                 let mut window_groups: RetransmitGroups = std::collections::HashMap::new();
                 for entry in ac_re.iter() {
                     let ((addr, seq), pending) = entry.pair();
-                    let window_idx = (*seq & SUDP_SEQ_MASK) >> 7;
+                    let window_idx = (*seq & SUDP_SEQ_MASK) >> SUDP_WINDOW_IDX_SHIFT;
                     window_groups.entry((*addr, window_idx)).or_default().push((
                         *seq,
                         pending.sent_at,
@@ -1634,7 +1696,7 @@ impl Engine {
                             // NORMAL RETRY: Resend only THIS window
                             for mut entry in ac_re.iter_mut() {
                                 let ((a, s), pending) = entry.pair_mut();
-                                let w = (*s & SUDP_SEQ_MASK) >> 7;
+                                let w = (*s & SUDP_SEQ_MASK) >> SUDP_WINDOW_IDX_SHIFT;
                                 if *a == *addr
                                     && w == *window_idx
                                     && pending.retries < SUDP_WINDOW_RETRIES
@@ -1787,7 +1849,13 @@ impl Engine {
             let chunk_data = &data[start..end];
             let chunk_size = end - start;
 
-            let packet_idx = (i as u64) % (SUDP_WINDOW_SIZE as u64);
+            let current_window_size = if let Some(peer) = self.sessions.get(&addr) {
+                peer.current_window_size
+            } else {
+                128 // Fallback
+            };
+
+            let packet_idx = (i as u64) % (current_window_size as u64);
 
             let mut throttle = false;
             let mut throttled_window_check = 0;
@@ -1803,7 +1871,7 @@ impl Engine {
                 };
 
                 let unacked = pending_window.saturating_sub(last_acked);
-                if unacked >= 2 {
+                if unacked >= 2 { // Keep throttle at 2 windows of current size
                     throttle = true;
                     throttled_window_check = pending_window - 1;
                 }
@@ -1834,19 +1902,14 @@ impl Engine {
                     let window_idx = peer.next_send_seq;
                     let dir_bit: u64 = if peer.is_server { SUDP_DIR_BIT } else { 0 };
 
-                    let is_end_stream: u64 = if i == total_chunks - 1 { 1 } else { 0 };
-                    let is_end_window: u64 =
-                        if packet_idx == (SUDP_WINDOW_SIZE as u64 - 1) || is_end_stream == 1 {
-                            1
-                        } else {
-                            0
-                        };
+                    let is_end_stream = i == total_chunks - 1;
+                    let is_end_window = (packet_idx == (current_window_size as u64 - 1)) || is_end_stream;
 
-                    let seq = dir_bit
-                        | (window_idx << 7)
-                        | ((packet_idx & 0x1F) << 2)
-                        | (is_end_window << 1)
-                        | is_end_stream;
+                    let seq: u64 = dir_bit
+                        | (window_idx << SUDP_WINDOW_IDX_SHIFT)
+                        | ((packet_idx & SUDP_PACKET_IDX_MASK) << SUDP_PACKET_IDX_SHIFT)
+                        | ((is_end_window as u64) << 1)
+                        | (is_end_stream as u64);
 
                     let mut ad = [0u8; 9];
                     ad[0] = SUDP_DATA;
@@ -1857,7 +1920,7 @@ impl Engine {
                     packet.extend_from_slice(&ad);
                     packet.extend_from_slice(&encrypted);
 
-                    if is_end_window == 1
+                    if is_end_window
                         && let Some(mut rep) = self.reputations.get_mut(&addr.ip())
                     {
                         rep.last_window_sent_at = Some(Instant::now());
