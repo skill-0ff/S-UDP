@@ -1,13 +1,13 @@
 [package]
 name = "s-udp"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "High-performance, adaptive, and cryptographically secure reliable UDP protocol with high-throughput windowing."
 license = "MIT"
 keywords = ["udp", "protocol", "reliable", "adaptive", "security"]
 categories = ["network-programming", "cryptography"]
-repository = "https://github.com/skill-0ff/Kinetix-Zero"
-homepage = "https://github.com/skill-0ff/Kinetix-Zero"
+repository = "https://github.com/skill-0ff/S-UDP"
+homepage = "https://github.com/skill-0ff/S-UDP"
 readme = "README.md"
 
 [dependencies]
