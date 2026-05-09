@@ -2048,6 +2048,12 @@ impl Engine {
 
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+        
+        // Finalize sequence: Ensure the NEXT call to send_data() starts with a fresh window index.
+        if let Some(mut peer) = self.sessions.get_mut(&addr) {
+            peer.next_send_seq += 1;
+            peer.streams_sent += 1;
+        }
 
         let total_elapsed = start_time.elapsed();
         let drain_elapsed = total_elapsed - send_elapsed;
