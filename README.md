@@ -1,6 +1,7 @@
 # 🚀 S-UDP: Smart User Datagram Protocol
 
 [![Rust](https://img.shields.io/badge/rust-stable-brightgreen.svg)](https://www.rust-lang.org)
+[![Crates.io](https://img.shields.io/crates/v/s-udp.svg)](https://crates.io/crates/s-udp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Security: ChaCha20-Poly1305](https://img.shields.io/badge/Security-ChaCha20--Poly1305-blueviolet.svg)](#security)
 
